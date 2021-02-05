@@ -74,8 +74,7 @@ class DivertToExample(bootstrapServers: String)(implicit system: ActorSystem[Not
         result
       }).asFlow
       .map(_._2) //get offset
-      .via(Committer.flow(committerSettings))
-      .toMat(Sink.ignore)(Keep.right)
+      .toMat(Committer.sink(committerSettings))(Keep.right)
   }
 
   def errorSink: Sink[(ProcessingError, CommittableOffset), Future[Done]] = {
@@ -86,49 +85,45 @@ class DivertToExample(bootstrapServers: String)(implicit system: ActorSystem[Not
       }
       .asFlow
       .map(_._2) //get offset
-      .via(Committer.flow(committerSettings))
-      .toMat(Sink.ignore)(Keep.right)
+      .toMat(Committer.sink(committerSettings))(Keep.right)
   }
 
-  def start(): DrainingControl[Done] = {
+  def start(): Future[Done] = {
 
-    /*val consumerSource =  Consumer.committableSource(kafkaConsumerSettings, Subscriptions.topics("topic"))
-                                  .asSourceWithContext(_.committableOffset)
-                                  .map(m => m.record.value())
-                                  .via(businessLogicFlow)
-                                  .asSource
+    val consumerSource =
+      Consumer
+        .committableSource(kafkaConsumerSettings, Subscriptions.topics("topic"))
+        .mapMaterializedValue(c => control.set(c))
+        .map(m => (m.record.value(),m.committableOffset))
 
     RestartSource.withBackoff(resetSettings){ () => consumerSource }
-*/
-    Consumer
-      .committableSource(kafkaConsumerSettings, Subscriptions.topics("topic"))
-      .map(m => (m.record.value(),m.committableOffset))
-      .divertingVia(serializeFlow, errorSink)
-      .divertingVia(businessLogicFlow, errorSink)
-      .toMat(successSink)(DrainingControl.apply)
-      .run()
+                .divertingVia(serializeFlow, errorSink)
+                .divertingVia(businessLogicFlow, errorSink)
+                .to(successSink)
+                .run()
+
+
+    control.get().shutdown()
   }
 }
 
 object SourceOpsNew{
 
   //Extend Source with a divertingVia operation which diverts errors to an error sink
-  implicit class KafkaSourceOps[A](source: Source[(A, CommittableOffset), Consumer.Control]) {
+  implicit class KafkaSourceOps[A](source: Source[(A, CommittableOffset), NotUsed]) {
 
     def divertingVia[B,C](
                          flow: FlowWithContext[A, CommittableOffset, Either[B,C], CommittableOffset, NotUsed],
                          errorSink: Sink[(B, CommittableOffset), Future[Done]]
-                       ): Source[(C, CommittableOffset), Consumer.Control] = { //Source with Consumer.Control
+                       ): Source[(C, CommittableOffset), NotUsed] = { //Source with Consumer.Control
 
+      val sink = Flow[(Either[B,C], CommittableOffset)]
+                        .collect {
+                          case (Left(error), committableOffset) =>(error, committableOffset)
+                        }.to(errorSink)
       source
         .via(flow)
-        .divertToMat(
-          Flow[(Either[B,C], CommittableOffset)].collect {
-            case (Left(error), committableOffset) =>
-              (error, committableOffset)
-          }.toMat(errorSink)(Keep.right),
-          _._1.isLeft
-        )(DrainingControl.apply) //Materialize using DrainingControl, which takes the provided Consumer.Control into account
+        .divertTo(sink,_._1.isLeft)
         .collect( pair=> {
           pair._1 match {
             case Right(e) => (e, pair._2)
