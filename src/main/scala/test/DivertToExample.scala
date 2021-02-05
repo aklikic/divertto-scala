@@ -67,14 +67,14 @@ class DivertToExample(bootstrapServers: String)(implicit system: ActorSystem[Not
     }
   }
 
-  def successSink: Sink[(BusinessLogicResult,CommittableOffset), Future[Done]] = {
+  def successFlow: Flow[(BusinessLogicResult, CommittableOffset), Done, NotUsed] = {
     FlowWithContext[BusinessLogicResult,CommittableOffset]
       .map(result => {
         log.info("{} - SUCCESS",result.data.data)
         result
       }).asFlow
       .map(_._2) //get offset
-      .toMat(Committer.sink(committerSettings))(Keep.right)
+      .via(Committer.flow(committerSettings))
   }
 
   def errorSink: Sink[(ProcessingError, CommittableOffset), Future[Done]] = {
@@ -93,14 +93,17 @@ class DivertToExample(bootstrapServers: String)(implicit system: ActorSystem[Not
     val consumerSource =
       Consumer
         .committableSource(kafkaConsumerSettings, Subscriptions.topics("topic"))
-        .mapMaterializedValue(c => control.set(c))
+        .mapMaterializedValue(c => {
+          control.set(c)
+          NotUsed
+        })
         .map(m => (m.record.value(),m.committableOffset))
+        .divertingVia(serializeFlow, errorSink)
+        .divertingVia(businessLogicFlow, errorSink)
+        .via(successFlow)
 
     RestartSource.withBackoff(resetSettings){ () => consumerSource }
-                .divertingVia(serializeFlow, errorSink)
-                .divertingVia(businessLogicFlow, errorSink)
-                .to(successSink)
-                .run()
+                 .run()
 
 
     control.get().shutdown()
